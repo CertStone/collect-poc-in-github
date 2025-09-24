@@ -18,6 +18,9 @@ GIT_RETRIES = 3 # 对于每个仓库操作，尝试3次
 GIT_RETRY_DELAY = 10 # 重试间隔（秒）
 MAX_WORKERS = 10 # 并发线程数
 
+# 安全增强：禁用外部协议与凭据助手（与 mirror_sync_pocs.py 对齐）
+GIT_SECURITY_OPTS = ['-c', 'protocol.ext.allow=never', '-c', 'credential.helper=']
+
 # --- 核心功能函数 ---
 
 def sanitize_filename(name: str) -> str:
@@ -28,11 +31,19 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', '', name)
 
 def run_command_with_retry(command: list[str], cwd: Path | str, repo_name: str, retries: int = GIT_RETRIES, delay: int = GIT_RETRY_DELAY) -> bool:
-    """带重试机制和更清晰日志的命令执行函数。"""
+    """带重试机制和更清晰日志的命令执行函数（加入安全参数）。"""
     for attempt in range(retries):
         try:
+            # 将安全参数插入到 'git' 之后
+            try:
+                git_index = command.index("git")
+                final_command = command[:git_index + 1] + GIT_SECURITY_OPTS + command[git_index + 1:]
+            except ValueError:
+                print(f"\n[!] 命令不包含 'git'：{command}")
+                return False
+
             subprocess.run(
-                command, cwd=cwd, check=True, capture_output=True, text=True,
+                final_command, cwd=cwd, check=True, capture_output=True, text=True,
                 encoding='utf-8', errors='ignore'
             )
             return True
