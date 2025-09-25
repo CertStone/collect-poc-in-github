@@ -1,4 +1,4 @@
-# PoC-in-GitHub 本地知识库同步工具
+# PoC-in-GitHub 本地知识库同步脚本
 
 ## 1. 项目简介
 
@@ -76,3 +76,4 @@ python mirror_sync_pocs.py
 特别感谢 Gemini-2.5-Pro 对代码编写的支持。
 
 项目采用MIT许可证开源。
+
