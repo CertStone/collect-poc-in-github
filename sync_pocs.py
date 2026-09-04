@@ -340,7 +340,8 @@ def sync_poc_repository(repo_url: str, local_path: Path, use_mirror: bool, rando
                     continue  # 设置远程地址失败，尝试下一个镜像
                 # 顺序：fetch → reset 到 origin/HEAD（失败则回退到主分支）→ clean
                 # 注意：origin/HEAD 在空仓库或某些上游配置下不存在，故需回退策略。
-                if not run_command(["git", "fetch", "--all", "--prune"], local_path, repo_name, retries=1):
+                # fetch 是网络操作，走默认 GIT_RETRIES 重试；其余均为本地操作，retries=1 即可。
+                if not run_command(["git", "fetch", "--all", "--prune"], local_path, repo_name):
                     continue
                 # 优先 origin/HEAD，回退到 origin/main、origin/master
                 reset_ok = False
