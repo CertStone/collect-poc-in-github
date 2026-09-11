@@ -56,6 +56,27 @@ GIT_SECURITY_OPTS = [
     '-c', 'credential.helper=',
 ]
 
+# 网络防挂死：git 默认对 HTTP 传输不设任何超时（http.lowSpeedLimit/lowSpeedTime
+# 未设置时不强制限速），镜像源"连上但不回数据"时 git 会永久阻塞、worker 线程卡死。
+# 注入 lowSpeed 后 git 会在低速持续一段时间后以 "Operation too slow" 自行退出，
+# 进而触发上层重试/跳过。不用 subprocess timeout 兜底：git 的网络活在孙进程
+# git-remote-http.exe 中，Python 只能杀掉直接子进程，孙进程持有输出管道会让
+# communicate() 永久阻塞（实测，Windows）。
+GIT_NET_OPTS = [
+    '-c', 'http.lowSpeedLimit=1000',  # 传输速度低于 1KB/s
+    '-c', 'http.lowSpeedTime=60',     # 且持续超过 60 秒，则 git 主动中断
+]
+
+# 失败处置策略（防止网络抖动/上游删库导致本地副本被误删）：
+#   ERR_NETWORK    网络/超时/限流等临时错误 → 跳过仓库，保留本地副本，下次运行再试
+#   ERR_NOT_FOUND  上游仓库已被删除(404)   → 跳过仓库，保留本地副本（本地可能是唯一副本）
+#   ERR_LOCAL      本地 .git 损坏           → 删除目录后重新克隆
+#   ERR_UNKNOWN    无法识别的错误           → 保守处理：跳过并保留本地副本
+ERR_NETWORK = 'network'
+ERR_NOT_FOUND = 'not_found'
+ERR_LOCAL = 'local'
+ERR_UNKNOWN = 'unknown'
+
 # --- 日志系统 ---
 
 IS_TTY = sys.stdout.isatty()
@@ -150,36 +171,75 @@ def _build_urls_to_try(original_url: str, use_mirror: bool, randomize: bool) -> 
     return urls_to_try
 
 
+def _classify_git_error(error_msg: str) -> str:
+    """根据 git 的 stderr 粗分类错误，供上层决定"跳过保留本地"还是"删库重克隆"。
+
+    分类原则：宁可放过、不可误删——只有明确识别为本地 .git 损坏的错误才归为
+    ERR_LOCAL（触发删库重克隆），网络/404/未知一律按可跳过的临时错误处理。
+    """
+    msg = error_msg.lower()
+    # 本地损坏：换源重试无法修复，需要删库重克隆
+    if any(p in msg for p in (
+        'not a git repository', 'bad object', 'corrupt', 'object file',
+        '.lock', 'no such remote',
+    )):
+        return ERR_LOCAL
+    # 上游仓库已删除/不可见：本地副本可能是唯一存档，必须保留
+    if 'not found' in msg or 'returned error: 404' in msg:
+        return ERR_NOT_FOUND
+    # 网络/镜像临时故障：下次运行可恢复（含 lowSpeed 中断的 "Operation too slow"）
+    if any(p in msg for p in (
+        'timed out', 'timeout', 'could not resolve host',
+        'connection reset', 'connection refused', 'connection closed',
+        'connection aborted', 'failed to connect', 'network is unreachable',
+        'no route to host', 'empty reply from server', 'gnutls_handshake',
+        'ssl', 'tls', 'certificate', 'proxy', 'rpc failed', 'curl',
+        'early eof', 'hung up', 'operation too slow',
+        'returned error: 403', 'returned error: 429', 'returned error: 50',
+    )):
+        return ERR_NETWORK
+    return ERR_UNKNOWN
+
+
 def run_command(command: list[str], cwd: Path | str, repo_name: str,
-                retries: int = GIT_RETRIES, delay: int = GIT_RETRY_DELAY) -> bool:
-    """为单个 git 命令执行重试逻辑，自动注入安全参数。"""
+                retries: int = GIT_RETRIES, delay: int = GIT_RETRY_DELAY) -> tuple[bool, str | None]:
+    """执行单个 git 命令并按需重试，自动注入安全参数与网络防挂死参数。
+
+    Returns:
+        (成功与否, 错误分类)。错误分类见 ERR_* 常量，成功时为 None。
+    """
+    # 将参数插入到 'git' 命令之后
+    try:
+        git_index = command.index("git")
+    except ValueError:
+        log_warn(f"命令不包含 'git'：{command}")
+        return False, ERR_UNKNOWN
+    final_command = command[:git_index + 1] + GIT_SECURITY_OPTS + GIT_NET_OPTS + command[git_index + 1:]
+
     for attempt in range(retries):
         try:
-            # 将安全参数插入到 'git' 命令之后
-            try:
-                git_index = command.index("git")
-            except ValueError:
-                log_warn(f"命令不包含 'git'：{command}")
-                return False
-            final_command = command[:git_index + 1] + GIT_SECURITY_OPTS + command[git_index + 1:]
-
             subprocess.run(
                 final_command, cwd=cwd, check=True, capture_output=True, text=True,
                 encoding='utf-8', errors='ignore',
             )
-            return True
+            return True, None
         except FileNotFoundError:
             log_warn(f"命令 '{command[0]}' 未找到。请确保 Git 已安装并在 PATH 中。")
-            return False
+            return False, ERR_UNKNOWN
         except subprocess.CalledProcessError as e:
             error_msg = (e.stderr or '').strip()
+            category = _classify_git_error(error_msg)
+            # 本地 .git 损坏重试无意义，直接返回交上层删库重克隆
+            if category == ERR_LOCAL:
+                log_warn(f"仓库 {repo_name} 本地仓库损坏，跳过重试。错误: {error_msg}")
+                return False, ERR_LOCAL
             if attempt < retries - 1:
                 log_warn(f"仓库 {repo_name} 操作失败 (尝试 {attempt + 1}/{retries})。将在 {delay} 秒后重试... 错误: {error_msg}")
                 time.sleep(delay)
             else:
                 log_warn(f"仓库 {repo_name} 操作失败，已达最大重试次数 ({retries} 次)。最终错误: {error_msg}")
-                return False
-    return False
+                return False, category
+    return False, ERR_UNKNOWN
 
 
 def _force_remove(func, path, exc_info):
@@ -233,14 +293,17 @@ def sync_meta_repo(use_mirror: bool, randomize: bool) -> None:
         try:
             for i, url in enumerate(urls_to_try):
                 log_info(f"尝试更新元数据仓库 (源 {i + 1}/{len(urls_to_try)})...")
-                if run_command(["git", "remote", "set-url", "origin", url], META_REPO_PATH, repo_name, retries=1):
-                    if run_command(["git", "pull"], META_REPO_PATH, repo_name):
+                set_ok, _ = run_command(["git", "remote", "set-url", "origin", url], META_REPO_PATH, repo_name, retries=1)
+                if set_ok:
+                    pull_ok, _ = run_command(["git", "pull"], META_REPO_PATH, repo_name)
+                    if pull_ok:
                         update_successful = True
                         break
         finally:
             # 无论结果如何，都恢复原始 URL
             if use_mirror:
-                if not run_command(["git", "remote", "set-url", "origin", original_url], META_REPO_PATH, repo_name, retries=1):
+                restore_ok, _ = run_command(["git", "remote", "set-url", "origin", original_url], META_REPO_PATH, repo_name, retries=1)
+                if not restore_ok:
                     log_warn("恢复元数据仓库 origin URL 失败，可能残留镜像地址。")
         if not update_successful:
             log_warn("警告: 更新元数据仓库失败。")
@@ -250,7 +313,8 @@ def sync_meta_repo(use_mirror: bool, randomize: bool) -> None:
         clone_successful = False
         for i, url in enumerate(urls_to_try):
             log_info(f"尝试克隆元数据仓库 (源 {i + 1}/{len(urls_to_try)})...")
-            if run_command(["git", "clone", url, str(META_REPO_PATH)], ".", repo_name):
+            clone_ok, _ = run_command(["git", "clone", url, str(META_REPO_PATH)], ".", repo_name)
+            if clone_ok:
                 clone_successful = True
                 break
         if clone_successful and use_mirror:
@@ -316,7 +380,12 @@ def collect_poc_data_from_local() -> dict:
 
 
 def sync_poc_repository(repo_url: str, local_path: Path, use_mirror: bool, randomize: bool) -> tuple[str, bool]:
-    """健壮地同步单个 PoC 仓库：尝试更新，失败则删除重来。
+    """健壮地同步单个 PoC 仓库：网络失败跳过保留本地，仅确认本地损坏才删库重克隆。
+
+    失败处置策略（防止网络抖动/上游删库导致本地副本被误删）：
+      - fetch 失败且为网络/上游 404/未知错误 → 跳过仓库，保留本地副本，下次运行再试；
+      - fetch 失败且为本地 .git 损坏，或 fetch 成功但本地 reset/clean 失败
+        → 删除目录后重新克隆。
 
     Returns:
         (repo_url, success)
@@ -334,44 +403,73 @@ def sync_poc_repository(repo_url: str, local_path: Path, use_mirror: bool, rando
     # 阶段 1: 如果是有效仓库，尝试强制更新
     if local_path.is_dir() and local_path.joinpath(".git").is_dir():
         update_successful = False
+        rebuild_reason = None          # 非 None 表示确认本地 .git 损坏，需要删库重克隆
+        last_fetch_err = ERR_UNKNOWN   # 所有源 fetch 均失败时的原因，仅用于日志
         try:
             for i, url in enumerate(urls_to_try):
-                if not run_command(["git", "remote", "set-url", "origin", url], local_path, repo_name, retries=1):
+                set_ok, set_err = run_command(["git", "remote", "set-url", "origin", url], local_path, repo_name, retries=1)
+                if not set_ok:
+                    if set_err == ERR_LOCAL:
+                        # 连 origin 都设置不了，本地 .git 已损坏
+                        rebuild_reason = "本地 .git 损坏（无法设置 origin）"
+                        break
                     continue  # 设置远程地址失败，尝试下一个镜像
                 # 顺序：fetch → reset 到 origin/HEAD（失败则回退到主分支）→ clean
                 # 注意：origin/HEAD 在空仓库或某些上游配置下不存在，故需回退策略。
                 # fetch 是网络操作，走默认 GIT_RETRIES 重试；其余均为本地操作，retries=1 即可。
-                if not run_command(["git", "fetch", "--all", "--prune"], local_path, repo_name):
+                fetch_ok, fetch_err = run_command(["git", "fetch", "--all", "--prune"], local_path, repo_name)
+                if not fetch_ok:
+                    if fetch_err == ERR_LOCAL:
+                        # 本地 .git 损坏，换源也无法修复，直接进入删库重克隆
+                        rebuild_reason = "本地 .git 损坏"
+                        break
+                    # 网络/超时/上游 404/未知错误：换下一个源（官方源兜底在最后）
+                    last_fetch_err = fetch_err
                     continue
-                # 优先 origin/HEAD，回退到 origin/main、origin/master
+                # fetch 已成功说明网络与远端正常，之后全是本地操作；
+                # 若 reset/clean 仍失败，可断定本地 .git 损坏
                 reset_ok = False
                 for ref in ("origin/HEAD", "origin/main", "origin/master"):
-                    if run_command(["git", "reset", "--hard", ref], local_path, repo_name, retries=1):
+                    ref_ok, _ = run_command(["git", "reset", "--hard", ref], local_path, repo_name, retries=1)
+                    if ref_ok:
                         reset_ok = True
                         break
                 if not reset_ok:
                     # 没有任何远程分支引用：可能是空仓库或损坏的 .git。
-                    # 空仓库：fetch 已成功，视为更新完成（重新 clone 也是同样结果）。
-                    # 损坏 .git：阶段 2 会"删了重来"。
-                    if not run_command(["git", "rev-parse", "HEAD"], local_path, repo_name, retries=1):
-                        # 连 HEAD 都解析不出，说明 .git 损坏，跳到阶段 2
-                        continue
+                    head_ok, _ = run_command(["git", "rev-parse", "HEAD"], local_path, repo_name, retries=1)
+                    if not head_ok:
+                        # 连 HEAD 都解析不出，说明 .git 损坏，删库重克隆
+                        rebuild_reason = "本地引用损坏（无法 reset / 解析 HEAD）"
+                        break
+                    # 空仓库：fetch 已成功，视为更新完成（重新 clone 也是同样结果）
                     reset_ok = True
-                if reset_ok and run_command(["git", "clean", "-fdx"], local_path, repo_name, retries=1):
+                clean_ok, _ = run_command(["git", "clean", "-fdx"], local_path, repo_name, retries=1)
+                if reset_ok and clean_ok:
                     update_successful = True
                     break  # 更新成功，跳出循环
+                # fetch 成功但本地 reset/clean 失败：本地 .git 损坏
+                rebuild_reason = "fetch 成功但本地 reset/clean 失败"
+                break
         finally:
             # 无论结果如何，都恢复原始 URL
             if use_mirror:
-                if not run_command(["git", "remote", "set-url", "origin", original_url], local_path, repo_name, retries=1):
+                restore_ok, _ = run_command(["git", "remote", "set-url", "origin", original_url], local_path, repo_name, retries=1)
+                if not restore_ok:
                     log_warn(f"仓库 {repo_name} 恢复 origin URL 失败，可能残留镜像地址。")
 
         if update_successful:
             return repo_url, True
 
-        log_warn(f"仓库 {repo_name} 强制更新失败，将执行删除后重新克隆策略。")
+        if rebuild_reason is None:
+            # 所有源的 fetch 均失败，且均为网络/上游不可达/未知错误：
+            # 跳过本仓库并保留本地副本，待下次运行网络恢复后自动重试
+            log_warn(f"仓库 {repo_name} 更新失败（原因: {last_fetch_err}，已尝试所有源），跳过并保留本地副本。")
+            return repo_url, False
 
-    # 阶段 2: 如果不是有效仓库，或更新失败，则执行"删了重来"策略
+        log_warn(f"仓库 {repo_name} {rebuild_reason}，将执行删除后重新克隆策略。")
+
+    # 阶段 2: 新仓库，或阶段 1 确认本地 .git 损坏时，执行"删了重来"策略
+    # （网络类 fetch 失败不会走到这里：已在阶段 1 提前返回并保留本地副本）
     if local_path.exists():
         if not safe_rmtree(local_path):
             # 清理失败时无法继续克隆
@@ -389,7 +487,8 @@ def sync_poc_repository(repo_url: str, local_path: Path, use_mirror: bool, rando
         # clone 前先确保目录不存在（前一次失败的 clone 可能留下 .git 残留）
         if local_path.exists():
             safe_rmtree(local_path)
-        if run_command(["git", "clone", "--depth", "1", url, str(local_path)], ".", repo_name):
+        clone_ok, _ = run_command(["git", "clone", "--depth", "1", url, str(local_path)], ".", repo_name)
+        if clone_ok:
             clone_successful = True
             break
         # clone 失败后若目录被部分创建，下次循环开头会再清理一次（双保险）
