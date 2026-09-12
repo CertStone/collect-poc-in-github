@@ -67,15 +67,36 @@ GIT_NET_OPTS = [
     '-c', 'http.lowSpeedTime=60',     # 且持续超过 60 秒，则 git 主动中断
 ]
 
-# 失败处置策略（防止网络抖动/上游删库导致本地副本被误删）：
-#   ERR_NETWORK    网络/超时/限流等临时错误 → 跳过仓库，保留本地副本，下次运行再试
-#   ERR_NOT_FOUND  上游仓库已被删除(404)   → 跳过仓库，保留本地副本（本地可能是唯一副本）
-#   ERR_LOCAL      本地 .git 损坏           → 删除目录后重新克隆
-#   ERR_UNKNOWN    无法识别的错误           → 保守处理：跳过并保留本地副本
+# 失败处置策略（防止网络抖动/限流/上游删库导致本地副本被误删）：
+#   ERR_NETWORK      网络/超时等临时错误     → 跳过仓库，保留本地副本，下次运行再试
+#   ERR_AUTH         401/要求凭据（匿名限流，或仓库已删/私有——GitHub 对匿名请求两者都回 401）
+#                                               → 同上：跳过并保留本地副本
+#   ERR_NOT_FOUND    上游仓库已被删除(404)   → 跳过仓库，保留本地副本（本地可能是唯一副本）
+#   ERR_INVALID_PATH 上游含 Windows 非法路径文件（文件名带冒号/保留设备名等）
+#                                               → 无法完整 checkout，永久性但非损坏：保留本地
+#                                                 （git 对象已存档），计为成功，不删库重克隆
+#   ERR_LOCAL        本地 .git 损坏          → 删除目录后重新克隆
+#   ERR_UNKNOWN      无法识别的错误          → 保守处理：跳过并保留本地副本
 ERR_NETWORK = 'network'
+ERR_AUTH = 'auth'
 ERR_NOT_FOUND = 'not_found'
+ERR_INVALID_PATH = 'invalid_path'
 ERR_LOCAL = 'local'
 ERR_UNKNOWN = 'unknown'
+
+# 分类在日志中的可读名称
+ERR_LABELS = {
+    ERR_NETWORK: '网络错误',
+    ERR_AUTH: '401/需凭据（匿名限流或仓库已删/私有）',
+    ERR_NOT_FOUND: '上游仓库不存在(404)',
+    ERR_INVALID_PATH: '上游含 Windows 非法路径',
+    ERR_LOCAL: '本地 .git 损坏',
+    ERR_UNKNOWN: '未知错误',
+}
+
+# 确定性失败：同一源上 7 秒后重试不会有不同结果，应立即返回
+# （恢复的希望全在上层换源或下一轮同步）
+ERR_DETERMINISTIC = (ERR_LOCAL, ERR_AUTH, ERR_NOT_FOUND, ERR_INVALID_PATH)
 
 # --- 日志系统 ---
 
@@ -116,6 +137,10 @@ def log_info(msg: str) -> None:
 
 def log_warn(msg: str) -> None:
     logging.warning(msg)
+
+
+def log_debug(msg: str) -> None:
+    logging.debug(msg)
 
 
 def log_progress(i: int, total: int, name: str) -> None:
@@ -175,18 +200,29 @@ def _classify_git_error(error_msg: str) -> str:
     """根据 git 的 stderr 粗分类错误，供上层决定"跳过保留本地"还是"删库重克隆"。
 
     分类原则：宁可放过、不可误删——只有明确识别为本地 .git 损坏的错误才归为
-    ERR_LOCAL（触发删库重克隆），网络/404/未知一律按可跳过的临时错误处理。
+    ERR_LOCAL（触发删库重克隆），网络/401/404/非法路径/未知一律按可跳过的错误处理。
     """
     msg = error_msg.lower()
-    # 本地损坏：换源重试无法修复，需要删库重克隆
+    # 上游含 Windows 非法路径文件：reset/checkout 永远无法完成，永久性但非损坏
+    if 'invalid path' in msg or 'could not reset index file' in msg:
+        return ERR_INVALID_PATH
+    # 本地损坏（含工作区 .gitmodules 等文件内容损坏导致 git 无法解析）：删库重克隆可痊愈
     if any(p in msg for p in (
         'not a git repository', 'bad object', 'corrupt', 'object file',
-        '.lock', 'no such remote',
+        '.lock', 'no such remote', 'bad config line',
     )):
         return ERR_LOCAL
     # 上游仓库已删除/不可见：本地副本可能是唯一存档，必须保留
     if 'not found' in msg or 'returned error: 404' in msg:
         return ERR_NOT_FOUND
+    # 401/要求凭据：匿名限流（临时，分钟级窗口）或仓库已删/私有（永久）。
+    # GitHub 对匿名请求把"仓库不存在"也回成 401，两种情况处置相同：跳过保留本地
+    if any(p in msg for p in (
+        'could not read username', 'could not read password',
+        'terminal prompts disabled', 'expected flush', 'authentication failed',
+        'returned error: 401',
+    )):
+        return ERR_AUTH
     # 网络/镜像临时故障：下次运行可恢复（含 lowSpeed 中断的 "Operation too slow"）
     if any(p in msg for p in (
         'timed out', 'timeout', 'could not resolve host',
@@ -202,17 +238,22 @@ def _classify_git_error(error_msg: str) -> str:
 
 
 def run_command(command: list[str], cwd: Path | str, repo_name: str,
-                retries: int = GIT_RETRIES, delay: int = GIT_RETRY_DELAY) -> tuple[bool, str | None]:
+                retries: int = GIT_RETRIES, delay: int = GIT_RETRY_DELAY,
+                quiet: bool = False) -> tuple[bool, str | None]:
     """执行单个 git 命令并按需重试，自动注入安全参数与网络防挂死参数。
+
+    quiet=True 时失败日志降为 DEBUG：供阶段 1 的探测性调用（set-url/reset/clean
+    逐个试错）使用，避免探测链的正常失败以 WARNING 刷屏。
 
     Returns:
         (成功与否, 错误分类)。错误分类见 ERR_* 常量，成功时为 None。
     """
+    log = log_debug if quiet else log_warn
     # 将参数插入到 'git' 命令之后
     try:
         git_index = command.index("git")
     except ValueError:
-        log_warn(f"命令不包含 'git'：{command}")
+        log(f"命令不包含 'git'：{command}")
         return False, ERR_UNKNOWN
     final_command = command[:git_index + 1] + GIT_SECURITY_OPTS + GIT_NET_OPTS + command[git_index + 1:]
 
@@ -221,23 +262,31 @@ def run_command(command: list[str], cwd: Path | str, repo_name: str,
             subprocess.run(
                 final_command, cwd=cwd, check=True, capture_output=True, text=True,
                 encoding='utf-8', errors='ignore',
+                # 收到 401 时 git 会尝试终端提示输入用户名。不设此项的话：无 TTY 时
+                # 走 /dev/tty 连环报错；有真终端时会阻塞等键盘输入，卡死 worker。
+                env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'},
             )
             return True, None
         except FileNotFoundError:
-            log_warn(f"命令 '{command[0]}' 未找到。请确保 Git 已安装并在 PATH 中。")
+            log(f"命令 '{command[0]}' 未找到。请确保 Git 已安装并在 PATH 中。")
             return False, ERR_UNKNOWN
         except subprocess.CalledProcessError as e:
             error_msg = (e.stderr or '').strip()
             category = _classify_git_error(error_msg)
-            # 本地 .git 损坏重试无意义，直接返回交上层删库重克隆
-            if category == ERR_LOCAL:
-                log_warn(f"仓库 {repo_name} 本地仓库损坏，跳过重试。错误: {error_msg}")
-                return False, ERR_LOCAL
+            # 确定性失败（本地损坏/401/404/非法路径）重试不会有不同结果，立即返回；
+            # 上层会换源（镜像出口 IP 不同，可能不受官方源限流影响）或留待下一轮同步
+            if category in ERR_DETERMINISTIC:
+                log(f"仓库 {repo_name} {ERR_LABELS.get(category, category)}，跳过同源重试。错误: {error_msg}")
+                return False, category
             if attempt < retries - 1:
-                log_warn(f"仓库 {repo_name} 操作失败 (尝试 {attempt + 1}/{retries})。将在 {delay} 秒后重试... 错误: {error_msg}")
+                log(f"仓库 {repo_name} 操作失败 (尝试 {attempt + 1}/{retries})。将在 {delay} 秒后重试... 错误: {error_msg}")
                 time.sleep(delay)
             else:
-                log_warn(f"仓库 {repo_name} 操作失败，已达最大重试次数 ({retries} 次)。最终错误: {error_msg}")
+                # retries==1 是刻意不重试（本地操作），不要渲染成"重试用尽"
+                if retries == 1:
+                    log(f"仓库 {repo_name} 操作失败（本地操作，不重试）。最终错误: {error_msg}")
+                else:
+                    log(f"仓库 {repo_name} 操作失败，已达最大尝试次数 ({retries} 次)。最终错误: {error_msg}")
                 return False, category
     return False, ERR_UNKNOWN
 
@@ -382,10 +431,11 @@ def collect_poc_data_from_local() -> dict:
 def sync_poc_repository(repo_url: str, local_path: Path, use_mirror: bool, randomize: bool) -> tuple[str, bool]:
     """健壮地同步单个 PoC 仓库：网络失败跳过保留本地，仅确认本地损坏才删库重克隆。
 
-    失败处置策略（防止网络抖动/上游删库导致本地副本被误删）：
-      - fetch 失败且为网络/上游 404/未知错误 → 跳过仓库，保留本地副本，下次运行再试；
+    失败处置策略（防止网络抖动/限流/上游删库导致本地副本被误删）：
+      - fetch 失败且为网络/401 限流/上游 404/未知错误 → 跳过仓库，保留本地副本，下次运行再试；
       - fetch 失败且为本地 .git 损坏，或 fetch 成功但本地 reset/clean 失败
-        → 删除目录后重新克隆。
+        → 删除目录后重新克隆；
+      - 上游含 Windows 非法路径文件 → 保留本地（git 对象已存档、工作区不完整），计为成功。
 
     Returns:
         (repo_url, success)
@@ -405,9 +455,10 @@ def sync_poc_repository(repo_url: str, local_path: Path, use_mirror: bool, rando
         update_successful = False
         rebuild_reason = None          # 非 None 表示确认本地 .git 损坏，需要删库重克隆
         last_fetch_err = ERR_UNKNOWN   # 所有源 fetch 均失败时的原因，仅用于日志
+        invalid_path_hit = False       # 上游含 Windows 非法路径文件（永久性，工作区无法完整）
         try:
             for i, url in enumerate(urls_to_try):
-                set_ok, set_err = run_command(["git", "remote", "set-url", "origin", url], local_path, repo_name, retries=1)
+                set_ok, set_err = run_command(["git", "remote", "set-url", "origin", url], local_path, repo_name, retries=1, quiet=True)
                 if not set_ok:
                     if set_err == ERR_LOCAL:
                         # 连 origin 都设置不了，本地 .git 已损坏
@@ -416,35 +467,40 @@ def sync_poc_repository(repo_url: str, local_path: Path, use_mirror: bool, rando
                     continue  # 设置远程地址失败，尝试下一个镜像
                 # 顺序：fetch → reset 到 origin/HEAD（失败则回退到主分支）→ clean
                 # 注意：origin/HEAD 在空仓库或某些上游配置下不存在，故需回退策略。
-                # fetch 是网络操作，走默认 GIT_RETRIES 重试；其余均为本地操作，retries=1 即可。
+                # fetch 是网络操作，走默认 GIT_RETRIES 重试；其余均为本地操作，retries=1
+                # 即可，且失败属探测链正常分支，用 quiet 降为 DEBUG 避免刷屏。
                 fetch_ok, fetch_err = run_command(["git", "fetch", "--all", "--prune"], local_path, repo_name)
                 if not fetch_ok:
                     if fetch_err == ERR_LOCAL:
                         # 本地 .git 损坏，换源也无法修复，直接进入删库重克隆
                         rebuild_reason = "本地 .git 损坏"
                         break
-                    # 网络/超时/上游 404/未知错误：换下一个源（官方源兜底在最后）
+                    # 网络/限流(401)/上游 404/未知：换下一个源（官方源兜底在最后；
+                    # 开镜像时换源仍有意义——镜像出口 IP 不同，可能不受官方源限流影响）
                     last_fetch_err = fetch_err
                     continue
                 # fetch 已成功说明网络与远端正常，之后全是本地操作；
-                # 若 reset/clean 仍失败，可断定本地 .git 损坏
+                # 若 reset/clean 仍失败，要么本地 .git 损坏，要么上游含 Windows 非法路径
                 reset_ok = False
                 for ref in ("origin/HEAD", "origin/main", "origin/master"):
-                    ref_ok, _ = run_command(["git", "reset", "--hard", ref], local_path, repo_name, retries=1)
+                    ref_ok, ref_err = run_command(["git", "reset", "--hard", ref], local_path, repo_name, retries=1, quiet=True)
                     if ref_ok:
                         reset_ok = True
                         break
+                    if ref_err == ERR_INVALID_PATH:
+                        # 树里有 Windows 建不了的文件名（冒号/保留设备名），换 ref 也一样
+                        invalid_path_hit = True
                 if not reset_ok:
                     # 没有任何远程分支引用：可能是空仓库或损坏的 .git。
-                    head_ok, _ = run_command(["git", "rev-parse", "HEAD"], local_path, repo_name, retries=1)
+                    head_ok, _ = run_command(["git", "rev-parse", "HEAD"], local_path, repo_name, retries=1, quiet=True)
                     if not head_ok:
                         # 连 HEAD 都解析不出，说明 .git 损坏，删库重克隆
                         rebuild_reason = "本地引用损坏（无法 reset / 解析 HEAD）"
                         break
                     # 空仓库：fetch 已成功，视为更新完成（重新 clone 也是同样结果）
                     reset_ok = True
-                clean_ok, _ = run_command(["git", "clean", "-fdx"], local_path, repo_name, retries=1)
-                if reset_ok and clean_ok:
+                clean_ok, _ = run_command(["git", "clean", "-fdx"], local_path, repo_name, retries=1, quiet=True)
+                if (reset_ok or invalid_path_hit) and clean_ok:
                     update_successful = True
                     break  # 更新成功，跳出循环
                 # fetch 成功但本地 reset/clean 失败：本地 .git 损坏
@@ -453,17 +509,20 @@ def sync_poc_repository(repo_url: str, local_path: Path, use_mirror: bool, rando
         finally:
             # 无论结果如何，都恢复原始 URL
             if use_mirror:
-                restore_ok, _ = run_command(["git", "remote", "set-url", "origin", original_url], local_path, repo_name, retries=1)
+                restore_ok, _ = run_command(["git", "remote", "set-url", "origin", original_url], local_path, repo_name, retries=1, quiet=True)
                 if not restore_ok:
                     log_warn(f"仓库 {repo_name} 恢复 origin URL 失败，可能残留镜像地址。")
 
         if update_successful:
+            if invalid_path_hit:
+                # 永久性状态：git 对象已同步存档，但工作区永远缺非法路径的文件
+                log_warn(f"仓库 {repo_name} 上游含 Windows 非法路径文件：git 对象已同步，工作区不完整。")
             return repo_url, True
 
         if rebuild_reason is None:
-            # 所有源的 fetch 均失败，且均为网络/上游不可达/未知错误：
+            # 所有源的 fetch 均失败，且均为网络/限流/上游不可达/未知错误：
             # 跳过本仓库并保留本地副本，待下次运行网络恢复后自动重试
-            log_warn(f"仓库 {repo_name} 更新失败（原因: {last_fetch_err}，已尝试所有源），跳过并保留本地副本。")
+            log_warn(f"仓库 {repo_name} 更新失败（原因: {ERR_LABELS.get(last_fetch_err, last_fetch_err)}，已尝试所有源），跳过并保留本地副本。")
             return repo_url, False
 
         log_warn(f"仓库 {repo_name} {rebuild_reason}，将执行删除后重新克隆策略。")
@@ -487,8 +546,14 @@ def sync_poc_repository(repo_url: str, local_path: Path, use_mirror: bool, rando
         # clone 前先确保目录不存在（前一次失败的 clone 可能留下 .git 残留）
         if local_path.exists():
             safe_rmtree(local_path)
-        clone_ok, _ = run_command(["git", "clone", "--depth", "1", url, str(local_path)], ".", repo_name)
+        clone_ok, clone_err = run_command(["git", "clone", "--depth", "1", url, str(local_path)], ".", repo_name)
         if clone_ok:
+            clone_successful = True
+            break
+        if clone_err == ERR_INVALID_PATH and local_path.joinpath(".git").is_dir():
+            # 上游含 Windows 非法路径文件：对象已拉取、checkout 失败，目录里有可用 .git。
+            # 换源结果相同，按"对象已存档"收尾（工作区不完整是永久性状态）
+            log_warn(f"仓库 {repo_name} 上游含 Windows 非法路径文件：git 对象已存档，工作区不完整。")
             clone_successful = True
             break
         # clone 失败后若目录被部分创建，下次循环开头会再清理一次（双保险）
